@@ -1,0 +1,118 @@
+name: RDP
+# 中文名称: 远程桌面协议
+
+on:
+  # 允许手动触发工作流
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    # 设置超时时间为 3600 分钟 (60 小时)
+    timeout-minutes: 3600
+
+    steps:
+      - name: 1. 配置核心 RDP 设置 (Configure Core RDP Settings)
+        run: |
+          # 启用远程桌面连接 (fDenyTSConnections = 0)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          # 禁用网络级别身份验证 (NLA) (UserAuthentication = 0, SecurityLayer = 0)
+          # 注意：出于安全考虑，生产环境中通常建议启用 NLA。
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # 移除任何已存在的同名防火墙规则
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # 添加入站规则，允许 TCP 端口 3389 上的所有连接
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # (可选) 重启远程桌面服务以确保配置生效
+          Restart-Service -Name TermService -Force
+
+      - name: 2. 创建 RDP 用户 (使用 GitHub Secret 密码)
+        run: |
+          # 导入 System.Security 程序集，用于安全字符串处理
+          Add-Type -AssemblyName System.Security
+          
+          # 1. 从 GitHub Secret 中获取密码字符串
+          # 此行在日志中会被屏蔽为 ***
+          $passwordString = "${{ secrets.RDP_USER_PASSWORD }}"
+          
+          # 2. 将普通字符串转换为安全字符串 (SecureString)，这是 New-LocalUser 命令所要求的格式
+          $securePass = ConvertTo-SecureString $passwordString -AsPlainText -Force
+          
+          # 3. 创建本地用户 "RDP"
+          # 必须包含 -Password 参数，并将 $securePass 作为值传入
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          
+          # 4. 将用户添加到 Administrators 和 Remote Desktop Users 组
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          Write-Host "RDP用户 'RDP' 已创建，密码来自 GitHub Secret。"
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "用户创建失败"
+              exit 1
+          }
+
+      - name: 3. 安装 Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: 4. 建立 Tailscale 连接
+        run: |
+          # 使用 Secret Auth Key 连接 Tailscale 并设置唯一主机名
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # 等待 Tailscale 分配 IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP 未分配。退出。"
+              exit 1
+          }
+          # 将 Tailscale IP 存储到环境变量中供后续步骤使用
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - name: 5. 验证 RDP 可访问性
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # 测试针对 Tailscale IP 上的 3389 端口的 TCP 连接
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "到 RDP 端口 3389 的 TCP 连接失败"
+              exit 1
+          }
+          Write-Host "TCP 连接成功！"
+
+      - name: 6. 保持连接 (Maintain Connection)
+        run: |
+          Write-Host "`n=== RDP 访问信息 ==="
+          Write-Host "地址 (Tailscale IP): $env:TAILSCALE_IP"
+          Write-Host "用户名: RDP"
+          Write-Host "密码: 请使用您在 GitHub Secrets 中设置的 RDP_USER_PASSWORD。"
+          Write-Host "==================`n"
+          
+          # 通过无限循环保持 runner 活跃
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP 活跃中 - 在工作流页面手动点击 Cancel 终止"
+              Start-Sleep -Seconds 300
+          }
